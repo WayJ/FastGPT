@@ -242,4 +242,10 @@ export class PgVectorCtrl {
 
     return total;
   };
+  findByVectorId = async (id: number) => {
+    const total = await PgClient.count(DatasetVectorTableName, {
+      where: [['id', id]]
+    });
+    return total > 0;
+  };
 }

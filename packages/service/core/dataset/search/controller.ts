@@ -4,6 +4,7 @@ import {
   SearchScoreTypeEnum
 } from '@fastgpt/global/core/dataset/constants';
 import { recallFromVectorStore } from '../../../common/vectorStore/controller';
+import { recallDatasetDataIndex } from '../../../common/index/controller';
 import { getVectorsByText } from '../../ai/embedding';
 import { getVectorModel } from '../../ai/model';
 import { MongoDatasetData } from '../data/schema';
@@ -105,6 +106,25 @@ export async function searchDatasetData(props: SearchDatasetDataProps) {
       forbidCollectionIdList: collections.map((item) => String(item._id))
     };
   };
+  const findDatasetDatasByQuery = async (
+    datasetIds: Array<String>,
+    collectionIds: Array<String>,
+    indexDataIds: Array<String>
+  ) => {
+    // get q and a
+    return (await MongoDatasetData.find(
+      {
+        teamId,
+        datasetId: { $in: datasetIds },
+        collectionId: { $in: collectionIds },
+        'indexes.dataId': { $in: indexDataIds }
+      },
+      'datasetId collectionId q a chunkIndex indexes'
+    )
+      .populate('collectionId', 'name fileId rawLink externalFileId externalFileUrl')
+      .lean()) as DatasetDataWithCollectionType[];
+  };
+
   /* 
     Collection metadata filter
     标签过滤：
@@ -237,6 +257,7 @@ export async function searchDatasetData(props: SearchDatasetDataProps) {
       }
     } catch (error) {}
   };
+  // 向量索引 召回
   const embeddingRecall = async ({
     query,
     limit,
@@ -317,6 +338,7 @@ export async function searchDatasetData(props: SearchDatasetDataProps) {
       tokens
     };
   };
+  // 全文索引 召回
   const fullTextRecall = async ({
     query,
     limit,
@@ -335,107 +357,61 @@ export async function searchDatasetData(props: SearchDatasetDataProps) {
         tokenLen: 0
       };
     }
-
-    let searchResults = (
-      await Promise.all(
-        datasetIds.map(async (id) => {
-          return MongoDatasetData.aggregate([
-            {
-              $match: {
-                teamId: new Types.ObjectId(teamId),
-                datasetId: new Types.ObjectId(id),
-                $text: { $search: jiebaSplit({ text: query }) },
-                ...(filterCollectionIdList && filterCollectionIdList.length > 0
-                  ? {
-                      collectionId: {
-                        $in: filterCollectionIdList.map((id) => new Types.ObjectId(id))
-                      }
-                    }
-                  : {})
-              }
-            },
-            {
-              $addFields: {
-                score: { $meta: 'textScore' }
-              }
-            },
-            {
-              $sort: {
-                score: { $meta: 'textScore' }
-              }
-            },
-            {
-              $limit: limit
-            },
-            {
-              $lookup: {
-                from: DatasetColCollectionName,
-                let: { collectionId: '$collectionId' },
-                pipeline: [
-                  {
-                    $match: {
-                      $expr: { $eq: ['$_id', '$$collectionId'] },
-                      forbid: { $eq: true } // 匹配被禁用的数据
-                    }
-                  },
-                  {
-                    $project: {
-                      _id: 1 // 只需要_id字段来确认匹配
-                    }
-                  }
-                ],
-                as: 'collection'
-              }
-            },
-            {
-              $match: {
-                collection: { $eq: [] } // 没有 forbid=true 的数据
-              }
-            },
-            {
-              $project: {
-                _id: 1,
-                datasetId: 1,
-                collectionId: 1,
-                updateTime: 1,
-                q: 1,
-                a: 1,
-                chunkIndex: 1,
-                score: 1
-              }
-            }
-          ]);
-        })
-      )
-    ).flat() as (DatasetDataSchemaType & { score: number })[];
+    let { results: searchResults } = await recallDatasetDataIndex({
+      teamId,
+      datasetIds,
+      text: query,
+      limit,
+      filterCollectionIdList
+    });
 
     // resort
     searchResults.sort((a, b) => b.score - a.score);
     searchResults.slice(0, limit);
 
+    let matching_collectionIds = searchResults.map((item) => item.collectionId);
+    let matching_indexDataIds = searchResults.map((item) => item.id?.trim());
+
     const collections = await MongoDatasetCollection.find(
       {
-        _id: { $in: searchResults.map((item) => item.collectionId) }
+        _id: { $in: matching_collectionIds }
       },
       '_id name fileId rawLink'
     );
 
+    const datasetDatas = await findDatasetDatasByQuery(
+      datasetIds,
+      matching_collectionIds,
+      matching_indexDataIds
+    );
+
     return {
-      fullTextRecallResults: searchResults.map((item, index) => {
-        const collection = collections.find((col) => String(col._id) === String(item.collectionId));
-        return {
-          id: String(item._id),
-          datasetId: String(item.datasetId),
-          collectionId: String(item.collectionId),
-          updateTime: item.updateTime,
-          ...getCollectionSourceData(collection),
-          q: item.q,
-          a: item.a,
-          chunkIndex: item.chunkIndex,
-          indexes: item.indexes,
-          score: [{ type: SearchScoreTypeEnum.fullText, value: item.score, index }]
-        };
-      }),
+      fullTextRecallResults: searchResults
+        .map((item, index) => {
+          const collection = collections.find(
+            (col) => String(col._id) === String(item.collectionId)
+          );
+          const datasetData = datasetDatas.find((col) =>
+            col.indexes.find((dataIndex) => String(dataIndex.dataId) === String(item.id))
+          );
+          // 如果datasetData未找到，返回null或者undefined
+          if (!datasetData) {
+            return null;
+          }
+          return {
+            id: String(datasetData._id),
+            datasetId: String(datasetData.datasetId),
+            collectionId: String(datasetData.collectionId),
+            updateTime: datasetData.updateTime,
+            ...getCollectionSourceData(collection),
+            q: datasetData.q,
+            a: datasetData.a,
+            chunkIndex: datasetData.chunkIndex,
+            indexes: datasetData.indexes,
+            score: [{ type: SearchScoreTypeEnum.fullText, value: item.score, index }]
+          };
+        })
+        .filter((item) => item !== null && item !== undefined), // 使用filter函数来移除所有map函数返回的null或undefined值
       tokenLen: 0
     };
   };

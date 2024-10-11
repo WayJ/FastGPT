@@ -334,4 +334,17 @@ export class MilvusCtrl {
       datasetId: item.datasetId
     }));
   };
+  findByVectorId = async (id: number) => {
+    const client = await this.getClient();
+
+    const result = await client.query({
+      collection_name: DatasetVectorTableName,
+      output_fields: ['count(*)'],
+      filter: `(id == "${id}")")`
+    });
+
+    const total = result.data?.[0]?.['count(*)'] as number;
+
+    return total > 0;
+  };
 }
