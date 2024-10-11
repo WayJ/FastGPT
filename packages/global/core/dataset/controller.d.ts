@@ -20,6 +20,10 @@ export type UpdateDatasetDataProps = {
   })[];
 };
 
+export type FixIndexDatasetDataProps = {
+  dataId: string;
+};
+
 export type PatchIndexesProps = {
   type: 'create' | 'update' | 'delete' | 'unChange';
   index: Omit<DatasetDataIndexItemType, 'dataId'> & {
